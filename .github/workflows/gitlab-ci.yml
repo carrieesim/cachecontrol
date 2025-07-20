@@ -1,0 +1,105 @@
+name: Generate, Sign, and Commit SBOM
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+
+  generate-and-sign-sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Syft
+        run: |
+          SYFT_VERSION="1.28.0"
+          curl -sSfL https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz | tar -xz
+          sudo mv syft /usr/local/bin/
+          syft version
+
+      - name: Generate SBOM in SPDX JSON format
+        run: |
+          syft dir:. -o spdx-json --file log4shell-vulnerable-app-spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBOM
+          path: log4shell-vulnerable-app-spdx.json
+
+      - name: Install Cosign
+        run: |
+          COSIGN_VERSION="v2.2.3"
+          wget https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+
+      - name: Sign SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign-blob --yes --oidc-issuer="https://token.actions.githubusercontent.com" \
+            --output-certificate log4shell-vulnerable-app-spdx.pem \
+            log4shell-vulnerable-app-spdx.json
+
+      - name: Commit SBOM and signature
+        run: |
+          git config --local user.email "simlixincarrie02@gmail.com"
+          git config --local user.name "carrieesim"
+          git add log4shell-vulnerable-app-spdx.json log4shell-vulnerable-app-spdx.pem
+          git commit -m "Add and sign SBOM" || echo "No changes to commit"
+          git pull --rebase origin master || true
+          git push || echo "Nothing to push"
+
+  vulnerability-analysis:
+    needs: generate-and-sign-sbom
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SBOM
+
+      - name: Install Grype
+        run: |
+          GRYPE_VERSION="0.88.0"
+          curl -sSfL https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz | tar -xz
+          sudo mv grype /usr/local/bin/
+          grype version
+
+      - name: Validate SBOM JSON
+        run: |
+          head -40 log4shell-vulnerable-app-spdx.json
+          jq empty log4shell-vulnerable-app-spdx.json
+
+      - name: Run vulnerability analysis
+        id: grype_scan
+        run: |
+          grype sbom:log4shell-vulnerable-app-spdx.json -o table > grype_output.txt
+          if grep -qE "(Critical|High|Medium|Low)" grype_output.txt; then
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Notify Teams via Power Automate
+        if: steps.grype_scan.outputs.found == 'true'
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+          -d '{
+            "text": "🚨 Vulnerability Detected in SBOM\n\nA vulnerability was detected during the SBOM scan of the repository.\nPlease review the generated SBOM report for details.\n\n- **Repository:** ${{ github.repository }}\n- **Branch:** ${{ github.ref_name }}\n- **Commit SHA:** ${{ github.sha }}\n\n🔗 [View Workflow Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          }' \
+          "${{ secrets.TEAMS_WEBHOOK }}"
